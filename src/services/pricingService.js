@@ -22,6 +22,7 @@ function ceilToStep(value) {
 function normUnit(u) {
   const x = String(u || "").trim().toUpperCase();
   if (x === "UNID") return "UNIDAD";
+  if (x === "BANDJ" || x === "BANDEJ") return "BANDEJA";
   return x;
 }
 
@@ -102,12 +103,18 @@ function normalizedCost(lot, variant) {
   // VENTA: BOLSA / BANDJ (si vendés así)
   // Solo soportamos directo si coincide la compra
   // -------------------------
-  if (unitSale === "BOLSA" || unitSale === "BANDJ") {
+  if (unitSale === "BOLSA" || unitSale === "BANDEJA") {
+    // directo si coincide la compra
     if (buyUnit === unitSale) return lot.unitCost;
+
+    // opcional: permitir CAJA -> BANDEJA con conversion (bandejas por caja)
+    if (buyUnit === "CAJA") {
+      if (!conversion) return null;
+      return lot.unitCost / conversion;
+    }
+
     return null;
   }
-
-  return null;
 }
 
 function pickFinalLot(lots, variant) {

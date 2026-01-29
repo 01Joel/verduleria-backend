@@ -13,7 +13,7 @@ function cleanStr(v) {
 
 function normalizeUnitSale(v) {
   const u = cleanStr(v).toUpperCase();
-  const allowed = ["KG", "ATADO", "UNIDAD", "BANDJ"];
+  const allowed = ["KG", "ATADO", "UNIDAD", "BANDEJA", "BOLSA"];
   return allowed.includes(u) ? u : "KG";
 }
 
@@ -21,7 +21,7 @@ function normalizeUnitBuy(v) {
   const raw = cleanStr(v);
   if (!raw) return "";
   const u = raw.toUpperCase();
-  const allowed = ["KG", "CAJA", "FARDO", "BOLSA", "ATADO", "UNIDAD", "BANDJ"];
+  const allowed = ["KG", "UNIDAD", "BOLSA", "CAJA", "FARDO", "ATADO"];
   return allowed.includes(u) ? u : "";
 }
 
@@ -113,7 +113,11 @@ async function createVariant(req, res) {
     if (err?.code === 11000) {
       return res.status(409).json({ ok: false, message: "Ya existe una variante con ese nombre para este producto" });
     }
-    return res.status(500).json({ ok: false, message: "Error creando variante" });
+    const msg =
+      err?.errors
+        ? Object.values(err.errors).map(e => e.message).join(" | ")
+        : (err?.message || "Error creando variante");
+    return res.status(500).json({ ok: false,message: msg });
   }
 }
 

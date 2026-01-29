@@ -14,7 +14,7 @@ const variantSchema = new mongoose.Schema(
     // ✅ Unidad de venta al público (precio del día se publica en esta unidad)
     unitSale: {
       type: String,
-      enum: ["KG", "ATADO", "UNID","BANDJ","BOLSA"],
+      enum: ["KG", "ATADO", "UNIDAD", "BANDEJA", "BOLSA"],
       default: "KG",
       trim: true,
     },
@@ -22,7 +22,7 @@ const variantSchema = new mongoose.Schema(
     // ✅ Unidad de compra sugerida (opcional)
     unitBuy: {
       type: String,
-      enum: ["KG", "CAJA", "FARDO", "BOLSA", "ATADO", "UNIDAD"],
+      enum: ["KG", "UNIDAD", "BOLSA", "CAJA", "FARDO", "ATADO"],
       default: "",
       trim: true,
     },
