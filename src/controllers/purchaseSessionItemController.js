@@ -5,6 +5,7 @@ const Variant = require("../models/Variant");
 const Supplier = require("../models/Supplier");
 const { recalcVariantDailyPrice } = require("../services/pricingService");
 const { getLastRefForVariant } = require("../services/refPriceService");
+const mongoose = require("mongoose");
 
 function emitSession(app, sessionId, event, payload) {
   const io = app.locals.io;
@@ -16,36 +17,43 @@ function isExpired(date) {
   return date && new Date(date).getTime() <= Date.now();
 }
 
-/**
- * Devuelve referencia automática para D:
- * - último PurchaseLot histórico de ESA variante (preferimos el más reciente)
- * - retorna { refPrice, refBuyUnit } o null si no existe
- */
-async function getLastLotRefForVariant(variantId, { excludeSessionId } = {}) {
-  const q = { variantId };
+function normUnit(u) {
+  const x = String(u || "").trim().toUpperCase();
+  if (!x) return null;
 
-  if (excludeSessionId) {
-    q.sessionId = { $ne: excludeSessionId };
-  }
+  // compat legacy
+  if (x === "UNID") return "UNIDAD";
+  if (x === "BANDJ" || x === "BANDEJ") return "BANDEJA";
 
-  const lastLot = await PurchaseLot.findOne(q)
-    .sort({ boughtAt: -1, createdAt: -1 })
-    .select("unitCost buyUnit boughtAt createdAt");
+  return x;
+}
 
-  if (!lastLot) return null;
+function isValidPositiveNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0;
+}
 
-  const refPrice = Number(lastLot.unitCost);
-  if (!Number.isFinite(refPrice) || refPrice <= 0) return null;
+function pickFallbackBuyUnitFromVariant(variant) {
+  // prioridad: unitBuy (si existe)
+  const ub = normUnit(variant?.unitBuy);
+  if (ub) return ub;
 
-  return {
-    refPrice,
-    refBuyUnit: lastLot.buyUnit || null,
-  };
+  // fallback: unitSale (sirve para planificar si no hay historial)
+  const us = normUnit(variant?.unitSale);
+  if (us) return us;
+
+  return "KG";
 }
 
 async function addItem(req, res) {
   const { id: sessionId } = req.params;
-  const { variantId, origin = "PLANIFICADO", plannedQty = null, refPrice = null } = req.body || {};
+  const {
+    variantId,
+    origin = "PLANIFICADO",
+    plannedQty = null,
+    refPrice = null,
+    refBuyUnit = null, // ✅ opcional: si el front lo manda
+  } = req.body || {};
 
   if (!variantId) return res.status(400).json({ ok: false, message: "variantId es requerido" });
 
@@ -56,43 +64,42 @@ async function addItem(req, res) {
     return res.status(409).json({ ok: false, message: "No se puede agregar ítems en una sesión cerrada" });
   }
 
-  const variant = await Variant.findById(variantId);
+  const variant = await Variant.findById(variantId).select("unitSale unitBuy");
   if (!variant) return res.status(404).json({ ok: false, message: "Variante no encontrada" });
 
-  let finalRefPrice = refPrice;
-  let finalRefBuyUnit = null;
+  // 1) Normalizar inputs manuales
+  const manualRefPrice = isValidPositiveNumber(refPrice) ? Number(refPrice) : null;
+  const manualRefBuyUnit = normUnit(refBuyUnit);
 
-  const refIsMissing =
-    finalRefPrice === null ||
-    finalRefPrice === undefined ||
-    finalRefPrice === "" ||
-    (Number.isFinite(Number(finalRefPrice)) && Number(finalRefPrice) <= 0);
+  // 2) Si no vino refPrice, intentamos traer referencia histórica
+  let finalRefPrice = manualRefPrice;
+  let finalRefBuyUnit = manualRefBuyUnit;
 
-  if (refIsMissing) {
-    const last = await getLastLotRefForVariant(variantId, { excludeSessionId: sessionId }).catch(() => null);
-    if (last) {
-      finalRefPrice = last.refPrice;
-      finalRefBuyUnit = last.refBuyUnit;
+  if (!finalRefPrice) {
+    const lastRef = await getLastRefForVariant(variantId).catch(() => null);
+
+    if (lastRef && isValidPositiveNumber(lastRef.refPrice)) {
+      finalRefPrice = Number(lastRef.refPrice);
+      finalRefBuyUnit = normUnit(lastRef.refBuyUnit);
     } else {
       finalRefPrice = null;
       finalRefBuyUnit = null;
     }
-  } else {
-    const n = Number(finalRefPrice);
-    finalRefPrice = Number.isFinite(n) && n > 0 ? n : null;
-    finalRefBuyUnit = null;
+  }
+
+  // 3) Fallback si sigue faltando unidad
+  if (!finalRefBuyUnit) {
+    finalRefBuyUnit = pickFallbackBuyUnitFromVariant(variant); // ✅ nunca null
   }
 
   try {
-    const lastRef = await getLastRefForVariant(variantId);
-
     const item = await PurchaseSessionItem.create({
       sessionId,
       variantId,
       origin,
       plannedQty,
-      refPrice: refPrice != null ? refPrice : lastRef.refPrice,
-      refBuyUnit: lastRef.refBuyUnit,
+      refPrice: finalRefPrice,     // ✅ puede ser null
+      refBuyUnit: finalRefBuyUnit, // ✅ nunca ""
       state: "PENDIENTE",
     });
 
@@ -114,7 +121,14 @@ async function addItem(req, res) {
         itemId: existing?._id,
       });
     }
-    throw err;
+
+    // ✅ devolver error real para debug (muy útil)
+    const msg =
+      err?.errors
+        ? Object.values(err.errors).map((e) => e.message).join(" | ")
+        : (err?.message || "Error agregando item");
+
+    return res.status(500).json({ ok: false, message: msg });
   }
 }
 
@@ -130,9 +144,8 @@ async function listItems(req, res) {
     .populate("reservedBy", "username role")
     .sort({ createdAt: 1 });
 
-  // ✅ 1) Resumen real de compras por variante dentro de ESTA sesión
   const lotsAgg = await PurchaseLot.aggregate([
-    { $match: { sessionId: new (require("mongoose").Types.ObjectId)(sessionId) } },
+    { $match: { sessionId: new mongoose.Types.ObjectId(sessionId) } },
     {
       $group: {
         _id: "$variantId",
@@ -152,7 +165,6 @@ async function listItems(req, res) {
     });
   }
 
-  // Limpieza lógica: reservas expiradas (como ya hacías)
   const normalized = items.map((it) => {
     const obj = it.toObject();
 
@@ -162,7 +174,6 @@ async function listItems(req, res) {
       obj.reserveExpiresAt = null;
     }
 
-    // ✅ 2) Adjuntar resumen de compra real
     const vId =
       obj?.variantId && typeof obj.variantId === "object"
         ? String(obj.variantId._id)
@@ -175,31 +186,6 @@ async function listItems(req, res) {
 
   return res.json({ ok: true, items: normalized });
 }
-
-/*async function listItems(req, res) {
-  const { id: sessionId } = req.params;
-
-  const items = await PurchaseSessionItem.find({ sessionId })
-    .populate({
-      path: "variantId",
-      populate: { path: "productId", select: "name imageUrl imagePublicId active" },
-      select: "nameVariant unitSale unitBuy imageUrl imagePublicId active productId",
-    })
-    .populate("reservedBy", "username role")
-    .sort({ createdAt: 1 });
-
-  const normalized = items.map((it) => {
-    const obj = it.toObject();
-    if (obj.state === "RESERVADO" && isExpired(obj.reserveExpiresAt)) {
-      obj.state = "PENDIENTE";
-      obj.reservedBy = null;
-      obj.reserveExpiresAt = null;
-    }
-    return obj;
-  });
-
-  return res.json({ ok: true, items: normalized });
-}*/
 
 async function removeItem(req, res) {
   const { id: sessionId, itemId } = req.params;
@@ -218,20 +204,13 @@ async function removeItem(req, res) {
     return res.status(409).json({ ok: false, message: "Solo se pueden quitar ítems PLANIFICADOS desde planificación" });
   }
 
-  if (item.state === "RESERVADO") {
-    return res.status(409).json({ ok: false, message: "No se puede quitar: el ítem está RESERVADO" });
-  }
-  if (item.state === "COMPRADO") {
-    return res.status(409).json({ ok: false, message: "No se puede quitar: el ítem ya fue COMPRADO" });
-  }
-  if (item.state === "CANCELADO") {
-    return res.status(409).json({ ok: false, message: "No se puede quitar: el ítem está CANCELADO" });
-  }
+  if (item.state === "RESERVADO") return res.status(409).json({ ok: false, message: "No se puede quitar: RESERVADO" });
+  if (item.state === "COMPRADO") return res.status(409).json({ ok: false, message: "No se puede quitar: COMPRADO" });
+  if (item.state === "CANCELADO") return res.status(409).json({ ok: false, message: "No se puede quitar: CANCELADO" });
 
   await PurchaseSessionItem.deleteOne({ _id: itemId, sessionId });
 
   emitSession(req.app, sessionId, "item_removed", { itemId });
-
   return res.json({ ok: true, itemId });
 }
 
@@ -312,7 +291,10 @@ async function reserveItem(req, res) {
       _id: itemId,
       sessionId,
       state: { $in: ["PENDIENTE", "RESERVADO"] },
-      $or: [{ state: "PENDIENTE" }, { state: "RESERVADO", reserveExpiresAt: { $lte: new Date() } }],
+      $or: [
+        { state: "PENDIENTE" },
+        { state: "RESERVADO", reserveExpiresAt: { $lte: new Date() } },
+      ],
     },
     {
       $set: {
@@ -376,75 +358,59 @@ async function cancelItem(req, res) {
 }
 
 /**
- * ✅ confirmItem CORREGIDO:
- * - buyUnit SIEMPRE sale de Variant.unitBuy
- * - CAJA: si qty=N crea N lotes (qty=1 por lote)
- * - NO CAJA: crea 1 lote con qty decimal
- * - ya no valida enum fijo
+ * ✅ confirmItem ROBUSTO:
+ * - buyUnit: prioridad Variant.unitBuy; fallback a item.refBuyUnit.
+ * - CAJA: qty entero => N lotes qty=1
+ * - resto: 1 lote qty decimal
  */
 async function confirmItem(req, res) {
   const { id: sessionId, itemId } = req.params;
   const { supplierId, qty, unitCost } = req.body || {};
 
   if (!supplierId || qty == null || unitCost == null) {
-    return res.status(400).json({
-      ok: false,
-      message: "supplierId, qty y unitCost son requeridos",
-    });
+    return res.status(400).json({ ok: false, message: "supplierId, qty y unitCost son requeridos" });
   }
 
   const q = Number(qty);
   const cost = Number(unitCost);
 
   if (!(q > 0) || !(cost > 0)) {
-    return res.status(400).json({
-      ok: false,
-      message: "qty y unitCost deben ser > 0",
-    });
+    return res.status(400).json({ ok: false, message: "qty y unitCost deben ser > 0" });
   }
 
   const session = await PurchaseSession.findById(sessionId);
-  if (!session) {
-    return res.status(404).json({ ok: false, message: "Sesión no encontrada" });
-  }
+  if (!session) return res.status(404).json({ ok: false, message: "Sesión no encontrada" });
   if (session.status !== "ABIERTA") {
-    return res.status(409).json({
-      ok: false,
-      message: "Solo se puede confirmar compra en sesión ABIERTA",
-    });
+    return res.status(409).json({ ok: false, message: "Solo se puede confirmar compra en sesión ABIERTA" });
   }
 
   const supplier = await Supplier.findById(supplierId);
   if (!supplier || !supplier.active) {
-    return res.status(404).json({
-      ok: false,
-      message: "Proveedor no válido",
-    });
+    return res.status(404).json({ ok: false, message: "Proveedor no válido" });
   }
 
   const item = await PurchaseSessionItem.findOne({ _id: itemId, sessionId });
-  if (!item) {
-    return res.status(404).json({ ok: false, message: "Ítem no encontrado" });
-  }
-  if (item.state === "CANCELADO") {
-    return res.status(409).json({ ok: false, message: "Ítem cancelado" });
-  }
+  if (!item) return res.status(404).json({ ok: false, message: "Ítem no encontrado" });
+  if (item.state === "CANCELADO") return res.status(409).json({ ok: false, message: "Ítem cancelado" });
 
-  // ✅ Cargar variante para obtener unitBuy real
+  // ✅ Variante (preferimos unitBuy)
   const variant = await Variant.findById(item.variantId).select("unitBuy");
-  if (!variant) {
-    return res.status(404).json({ ok: false, message: "Variante no encontrada" });
-  }
+  if (!variant) return res.status(404).json({ ok: false, message: "Variante no encontrada" });
 
-  const buyUnit = String(variant.unitBuy || "").trim().toUpperCase();
+  // ✅ buyUnit robusto: Variant.unitBuy -> item.refBuyUnit
+  const buyUnit = normUnit(variant.unitBuy) || normUnit(item.refBuyUnit);
+
   if (!buyUnit) {
-    return res.status(400).json({ ok: false, message: "La variante no tiene unitBuy definido" });
+    return res.status(400).json({
+      ok: false,
+      message: "No se puede confirmar: define unitBuy en la variante o define refBuyUnit en el ítem",
+    });
   }
 
   const isCaja = buyUnit === "CAJA";
 
-  // ✅ CAJA: qty=N => crear N lotes qty=1
   let createdLots = [];
+
   if (isCaja) {
     if (!Number.isInteger(q)) {
       return res.status(400).json({
@@ -468,7 +434,6 @@ async function confirmItem(req, res) {
       createdLots.push(lot);
     }
   } else {
-    // ✅ No CAJA: 1 lote con qty decimal permitido
     const lot = await PurchaseLot.create({
       sessionId,
       variantId: item.variantId,
@@ -482,13 +447,11 @@ async function confirmItem(req, res) {
     createdLots = [lot];
   }
 
-  // Marcar ítem como comprado
   item.state = "COMPRADO";
   item.reservedBy = null;
   item.reserveExpiresAt = null;
   await item.save();
 
-  // Recalcular precio diario (1 vez)
   const dailyPrice = await recalcVariantDailyPrice(sessionId, item.variantId);
 
   emitSession(req.app, sessionId, "item_confirmed", {
@@ -502,12 +465,7 @@ async function confirmItem(req, res) {
     dailyPrice,
   });
 
-  return res.json({
-    ok: true,
-    item,
-    lots: createdLots,
-    dailyPrice,
-  });
+  return res.json({ ok: true, item, lots: createdLots, dailyPrice });
 }
 
 async function updatePlannedQty(req, res) {
@@ -515,7 +473,6 @@ async function updatePlannedQty(req, res) {
   const { plannedQty } = req.body || {};
 
   const n = Number(plannedQty);
-
   if (!Number.isFinite(n) || n <= 0) {
     return res.status(400).json({ ok: false, message: "plannedQty debe ser un número > 0" });
   }
@@ -558,31 +515,25 @@ async function updateItem(req, res) {
   const { plannedQty, refPrice, refBuyUnit } = req.body || {};
 
   if (plannedQty !== undefined) {
-    if (plannedQty === null || plannedQty === "") {
-      item.plannedQty = null;
-    } else {
+    if (plannedQty === null || plannedQty === "") item.plannedQty = null;
+    else {
       const q = Number(plannedQty);
-      if (!Number.isFinite(q) || q <= 0) {
-        return res.status(400).json({ ok: false, message: "plannedQty inválido (debe ser > 0)" });
-      }
+      if (!Number.isFinite(q) || q <= 0) return res.status(400).json({ ok: false, message: "plannedQty inválido (>0)" });
       item.plannedQty = q;
     }
   }
 
   if (refPrice !== undefined) {
-    if (refPrice === null || refPrice === "") {
-      item.refPrice = null;
-    } else {
+    if (refPrice === null || refPrice === "") item.refPrice = null;
+    else {
       const p = Number(refPrice);
-      if (!Number.isFinite(p) || p < 0) {
-        return res.status(400).json({ ok: false, message: "refPrice inválido (debe ser >= 0)" });
-      }
+      if (!Number.isFinite(p) || p < 0) return res.status(400).json({ ok: false, message: "refPrice inválido (>=0)" });
       item.refPrice = p;
     }
   }
 
   if (refBuyUnit !== undefined) {
-    item.refBuyUnit = refBuyUnit || null;
+    item.refBuyUnit = refBuyUnit; // setter normaliza / convierte "" -> null
   }
 
   await item.save();

@@ -1,4 +1,14 @@
 const mongoose = require("mongoose");
+function normUnit(u) {
+  const x = String(u || "").trim().toUpperCase();
+  if (!x) return null;
+
+  // compat legacy
+  if (x === "UNID") return "UNIDAD";
+  if (x === "BANDJ" || x === "BANDEJ") return "BANDEJA";
+
+  return x;
+}
 
 const purchaseSessionItemSchema = new mongoose.Schema(
   {
@@ -9,7 +19,15 @@ const purchaseSessionItemSchema = new mongoose.Schema(
 
     plannedQty: { type: Number, default: null },
     refPrice: { type: Number, default: null },   
-    refBuyUnit: { type: String, enum: ["KG", "CAJA", "ATADO", "UNIDAD", "BOLSA"], default: null, set: (v) => String(v || "").trim().toUpperCase(),},
+    refBuyUnit: {
+      type: String,
+      enum: ["KG", "CAJA", "ATADO", "UNIDAD", "BOLSA", "FARDO", "BANDEJA"],
+      default: null,
+      set: (v) => {
+        if (v === null || v === undefined || v === "") return null;
+        return String(v).trim().toUpperCase();
+      },
+    },
 
     state: {
       type: String,
