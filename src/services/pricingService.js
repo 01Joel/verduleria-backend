@@ -95,7 +95,11 @@ function normalizedCost(lot, variant) {
       if (!conversion) return null;
       return lot.unitCost / conversion;
     }
-
+      // ✅ CAJA -> ATADO (conversion = atados_por_caja)
+    if (buyUnit === "CAJA") {
+      if (!conversion) return null;
+      return lot.unitCost / conversion;
+    }
     return null;
   }
 
